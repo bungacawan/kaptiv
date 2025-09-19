@@ -1,13 +1,11 @@
-// index.js - Kaptiv Gmail OAuth helper + send_email endpoint
-// DEV notes: uses in-memory stores for quick testing. Replace with a persistent DB + KMS encryption in production.
-
+// index.js - Kaptiv Gmail OAuth helper + send_email with persistent storage (Supabase)
 import express from "express";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { fileURLToPath } from "url";
-
-import { sendEmailViaGmail } from "./gmailHelper.js"; // must exist in same folder
+import { createClient } from "@supabase/supabase-js";
+import { sendEmailViaGmail } from "./gmailHelper.js";
 
 const app = express();
 app.use(express.json());
@@ -15,13 +13,20 @@ app.use(express.json());
 // ENV vars (set these in Vercel)
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI; // e.g. https://kaptiv-eight.vercel.app/oauth2/callback
+const REDIRECT_URI = process.env.REDIRECT_URI; // e.g., https://kaptiv-eight.vercel.app/oauth2/callback
 const KAPTIV_API_KEY = process.env.KAPTIV_API_KEY;
 const FRONTEND_RETURN = process.env.FRONTEND_RETURN || "https://kaptiv.io/gmail-connected";
 
-// DEV: in-memory stores. Replace with DB+encryption for production.
-const stateStore = new Map();      // state -> { owner_id, return_url, expires_at }
-const credentialStore = new Map(); // owner_id -> { email, refresh_token, created_at }
+// Supabase client (server-side)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  console.warn("Supabase env vars not set. Please set SUPABASE_URL and SUPABASE_SERVICE_KEY.");
+}
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// In-memory state store for OAuth state -> owner_id mapping (temporary)
+const stateStore = new Map(); // state -> { owner_id, return_url, expires_at }
 
 // Helper middleware: require API key in Authorization header
 function requireApiKey(req, res, next) {
@@ -33,11 +38,7 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// =================
 // POST /oauth/start
-// Starts OAuth flow — returns auth_url and state.
-// Body: { owner_id: "<kaptiv-user-id>", return_url: "https://kaptiv.io/gmail-connected" (optional) }
-// =================
 app.post("/oauth/start", requireApiKey, (req, res) => {
   try {
     const { owner_id, return_url } = req.body || {};
@@ -47,7 +48,7 @@ app.post("/oauth/start", requireApiKey, (req, res) => {
     stateStore.set(state, {
       owner_id,
       return_url: return_url || FRONTEND_RETURN,
-      expires_at: Date.now() + 1000 * 60 * 15 // 15 minutes TTL
+      expires_at: Date.now() + 1000 * 60 * 15
     });
 
     const scope = encodeURIComponent("https://www.googleapis.com/auth/gmail.send openid email profile");
@@ -64,11 +65,7 @@ app.post("/oauth/start", requireApiKey, (req, res) => {
   }
 });
 
-// =================
 // GET /oauth2/callback
-// Google redirects here with ?code=...&state=...
-// Exchanges code for tokens and stores refresh_token (DEV: in-memory).
-// =================
 app.get("/oauth2/callback", async (req, res) => {
   try {
     const { code, state } = req.query;
@@ -78,7 +75,7 @@ app.get("/oauth2/callback", async (req, res) => {
     if (!entry) return res.status(400).send("Invalid or expired state.");
     stateStore.delete(state);
 
-    // Exchange authorization code for tokens
+    // Exchange code for tokens
     const tokenRes = await axios.post(
       "https://oauth2.googleapis.com/token",
       new URLSearchParams({
@@ -93,7 +90,7 @@ app.get("/oauth2/callback", async (req, res) => {
 
     const { refresh_token, id_token } = tokenRes.data;
 
-    // Extract email from id_token (if available)
+    // Extract email from id_token
     let email = null;
     if (id_token) {
       try {
@@ -104,14 +101,24 @@ app.get("/oauth2/callback", async (req, res) => {
       }
     }
 
-    // Store refresh_token (DEV: in-memory; do not log token value)
-    credentialStore.set(entry.owner_id, {
-      email,
-      refresh_token: refresh_token || null,
-      created_at: new Date().toISOString()
-    });
-
-    console.log("Stored credential for owner:", entry.owner_id, { email, hasRefresh: !!refresh_token });
+    // Persist to Supabase
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+      console.warn("Skipping persistence: SUPABASE not configured.");
+    } else {
+      const upsert = {
+        owner_id: entry.owner_id,
+        email: email || null,
+        refresh_token: refresh_token || null,
+        created_at: new Date().toISOString()
+      };
+      const { error } = await supabase.from("credentials").upsert(upsert, { onConflict: "owner_id" });
+      if (error) {
+        console.error("Supabase upsert error:", error);
+        // continue — we still redirect but warn
+      } else {
+        console.log("Persisted credential for owner:", entry.owner_id, { email, hasRefresh: !!refresh_token });
+      }
+    }
 
     // Redirect back to Bubble frontend
     const redirectBack = entry.return_url || FRONTEND_RETURN;
@@ -123,37 +130,47 @@ app.get("/oauth2/callback", async (req, res) => {
   }
 });
 
-// =================
 // GET /status
-// Optional: Bubble can call this (with API key) to confirm connection and get connected email
-// Query: ?owner_id=...
-// =================
-app.get("/status", requireApiKey, (req, res) => {
+app.get("/status", requireApiKey, async (req, res) => {
   const owner_id = req.query.owner_id;
   if (!owner_id) return res.status(400).json({ ok: false, error: "owner_id required" });
-  const cred = credentialStore.get(owner_id);
-  if (!cred) return res.json({ ok: true, connected: false });
-  return res.json({ ok: true, connected: true, email: cred.email, created_at: cred.created_at });
+
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+      return res.json({ ok: true, connected: false });
+    }
+    const { data, error } = await supabase.from("credentials").select("refresh_token, email, created_at").eq("owner_id", owner_id).maybeSingle();
+    if (error) {
+      console.error("Supabase read error:", error);
+      return res.status(500).json({ ok: false, error: "db_error" });
+    }
+    if (!data) return res.json({ ok: true, connected: false });
+    return res.json({ ok: true, connected: !!data.refresh_token, email: data.email, created_at: data.created_at });
+  } catch (err) {
+    console.error("status error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error" });
+  }
 });
 
-// =================
 // POST /send_email
-// Body: { owner_id, to, subject, body_text }
-// Uses stored refresh_token for owner_id and calls gmailHelper.sendEmailViaGmail
-// =================
 app.post("/send_email", requireApiKey, async (req, res) => {
   try {
     const { owner_id, to, subject, body_text } = req.body || {};
     if (!owner_id || !to) return res.status(400).json({ ok: false, error: "owner_id and to required" });
 
-    console.log("send_email request:", { owner_id, to, subject });
-
-    const refreshToken = credentialStore.get(owner_id)?.refresh_token;
-    console.log("credentialStore has owner:", credentialStore.has(owner_id), "hasRefresh:", !!refreshToken);
-
+    // read credential from Supabase
+    const { data, error } = await supabase.from("credentials").select("refresh_token, email").eq("owner_id", owner_id).maybeSingle();
+    if (error) {
+      console.error("Supabase read error:", error);
+      return res.status(500).json({ ok: false, error: "db_error" });
+    }
+    const refreshToken = data?.refresh_token || null;
     if (!refreshToken) return res.status(400).json({ ok: false, error: "No Gmail connected for this user" });
 
     const messageId = await sendEmailViaGmail(refreshToken, to, subject || "(no subject)", body_text || "");
+    // optional: update last_used_at
+    await supabase.from("credentials").update({ last_used_at: new Date().toISOString() }).eq("owner_id", owner_id);
+
     return res.json({ ok: true, message_id: messageId });
   } catch (err) {
     console.error("send_email error:", err?.response?.data || err?.message || err);
@@ -161,12 +178,9 @@ app.post("/send_email", requireApiKey, async (req, res) => {
   }
 });
 
-// =================
-// ESM-safe local server start (Vercel will import the app; local dev can set NODE_ENV=development or RUN_LOCAL=true)
-// =================
+// ESM-safe local start
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
 if (process.env.NODE_ENV === "development" || process.env.RUN_LOCAL === "true") {
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log(`Server listening on port ${port}`));

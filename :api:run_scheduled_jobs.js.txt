@@ -1,0 +1,26 @@
+curl -i -X POST "https://kaptiv-eight.vercel.app/send_email" \
+  -H "Authorization: Bearer dcd1a343da2e730310fd56f8f21e92aeee2a3ef3f70e5d59c4d929712056420c" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "owner_id": "1758265201530x816811914245561600",
+    "to": "bungacawan@gmail.com",
+    "subject": "Kaptiv test",
+    "body_text": "Hello! This is a test sent via Gmail API."
+  }'
+
+
+curl -i -X GET "https://kaptiv-eight.vercel.app/status?owner_id=1758265201530x816811914245561600" \
+  -H "Authorization: Bearer dcd1a343da2e730310fd56f8f21e92aeee2a3ef3f70e5d59c4d929712056420c"
+
+
+curl -i -X POST "https://kaptiv-eight.vercel.app/schedule_email" \
+  -H "Authorization: Bearer dcd1a343da2e730310fd56f8f21e92aeee2a3ef3f70e5d59c4d929712056420c" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "owner_id":"1758265201530x816811914245561600",
+    "to":"bungacawan@gmail.com",
+    "subject":"Scheduled test",
+    "body_text":"Hello later!",
+    "scheduled_for":"2025-09-20T03:50:00Z",
+    "timezone":"Asia/Singapore"
+  }'

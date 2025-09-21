@@ -178,6 +178,48 @@ app.post("/send_email", requireApiKey, async (req, res) => {
   }
 });
 
+// POST /schedule_email
+app.post("/schedule_email", requireApiKey, async (req, res) => {
+  try {
+    const { owner_id, to, subject, body_text, scheduled_for, timezone } = req.body || {};
+
+    // Basic validation
+    if (!owner_id || !to || !scheduled_for) {
+      return res.status(400).json({ ok: false, error: "owner_id, to and scheduled_for are required" });
+    }
+
+    // Ensure scheduled_for is a valid ISO timestamp
+    const when = new Date(scheduled_for);
+    if (Number.isNaN(when.getTime())) {
+      return res.status(400).json({ ok: false, error: "scheduled_for must be a valid ISO datetime string (UTC recommended)" });
+    }
+
+    // Insert into Supabase scheduled_emails table
+    const { data, error } = await supabase
+      .from("scheduled_emails")
+      .insert([{
+        owner_id,
+        to_email: to,
+        subject: subject || null,
+        body_text: body_text || null,
+        scheduled_for: when.toISOString(), // keep in UTC
+        timezone: timezone || null
+      }])
+      .select()
+      .single();
+
+    if (error) {
+      console.error("schedule_email db error:", error);
+      return res.status(500).json({ ok: false, error: "db_error", detail: error.message });
+    }
+
+    return res.json({ ok: true, job: data });
+  } catch (err) {
+    console.error("schedule_email error:", err);
+    return res.status(500).json({ ok: false, error: "internal_error", detail: err.message });
+  }
+});
+
 // ESM-safe local start
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -185,5 +227,6 @@ if (process.env.NODE_ENV === "development" || process.env.RUN_LOCAL === "true") 
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log(`Server listening on port ${port}`));
 }
+
 
 export default app;

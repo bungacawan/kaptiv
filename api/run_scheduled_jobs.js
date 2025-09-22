@@ -16,6 +16,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 /**
  * Sends an email using Gmail OAuth2 refresh token.
+ * Returns the messageId on success.
  */
 async function sendEmailViaGmail(refreshToken, to, subject, body_text) {
   const oAuth2Client = new google.auth.OAuth2(
@@ -35,17 +36,15 @@ async function sendEmailViaGmail(refreshToken, to, subject, body_text) {
     body_text || ''
   ];
 
-  const raw = Buffer.from(rawLines.join('\n'))
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+  const raw = Buffer.from(rawLines.join('\n')).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
   const gmail = google.gmail({ version: 'v1', auth: oAuth2Client });
   const res = await gmail.users.messages.send({
     userId: 'me',
     requestBody: { raw }
   });
+
   return res?.data?.id;
 }
 
@@ -54,7 +53,11 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+  // Trim incoming header to handle cron-job.org quirks
+  const incomingSecret = (req.headers['x-worker-secret'] || '').trim();
+  console.log('x-worker-secret received:', incomingSecret);
+
+  if (incomingSecret !== WORKER_SECRET) {
     return res.status(401).json({ error: 'unauthorized' });
   }
 
@@ -69,13 +72,14 @@ export default async function handler(req, res) {
       return res.status(200).json({ summary: 'no jobs', claimed: 0 });
     }
 
-    const summary = { claimed: claimedJobs.length, sent: 0, failed: 0, skipped: 0, failures: [] };
+    let summary = { claimed: claimedJobs.length, sent: 0, failed: 0, skipped: 0, failures: [] };
 
     for (const job of claimedJobs) {
+      const jobId = job.id;
       try {
         const { data: cred, error: credErr } = await supabase
           .from('credentials')
-          .select('email, refresh_token')
+          .select('refresh_token')
           .eq('owner_id', job.owner_id)
           .maybeSingle();
 
@@ -86,48 +90,52 @@ export default async function handler(req, res) {
             status: 'failed',
             last_error: 'no_refresh_token',
             updated_at: new Date().toISOString()
-          }).eq('id', job.id);
+          }).eq('id', jobId);
 
           summary.failed++;
-          summary.failures.push({ id: job.id, reason: 'no refresh token' });
+          summary.failures.push({ id: jobId, reason: 'no refresh token' });
           continue;
         }
 
-        // Send email
+        // Attempt send
         const messageId = await sendEmailViaGmail(cred.refresh_token, job.to_email, job.subject, job.body_text);
 
+        // On success
         await supabase.from('scheduled_emails').update({
           status: 'sent',
           message_id: messageId || null,
           updated_at: new Date().toISOString()
-        }).eq('id', job.id);
+        }).eq('id', jobId);
 
         summary.sent++;
       } catch (err) {
-        const attempts = job.attempts || 1;
+        try {
+          const attempts = job.attempts || 1;
+          if (attempts < MAX_ATTEMPTS) {
+            const backoffMs = Math.pow(2, attempts) * 60 * 1000;
+            const nextRun = new Date(Date.now() + backoffMs).toISOString();
 
-        if (attempts < MAX_ATTEMPTS) {
-          const backoffMs = Math.pow(2, attempts) * 60 * 1000;
-          const nextRun = new Date(Date.now() + backoffMs).toISOString();
-
-          await supabase.from('scheduled_emails').update({
-            status: 'scheduled',
-            scheduled_for: nextRun,
-            last_error: String(err?.message || err).slice(0, 1000),
-            attempts: attempts + 1,
-            updated_at: new Date().toISOString()
-          }).eq('id', job.id);
-        } else {
-          await supabase.from('scheduled_emails').update({
-            status: 'failed',
-            last_error: String(err?.message || err).slice(0, 1000),
-            attempts: attempts + 1,
-            updated_at: new Date().toISOString()
-          }).eq('id', job.id);
+            await supabase.from('scheduled_emails').update({
+              status: 'scheduled',
+              scheduled_for: nextRun,
+              last_error: String(err?.message || err).slice(0, 1000),
+              attempts: attempts + 1,
+              updated_at: new Date().toISOString()
+            }).eq('id', jobId);
+          } else {
+            await supabase.from('scheduled_emails').update({
+              status: 'failed',
+              last_error: String(err?.message || err).slice(0, 1000),
+              attempts: (job.attempts || 1) + 1,
+              updated_at: new Date().toISOString()
+            }).eq('id', jobId);
+          }
+        } catch (innerErr) {
+          console.error('Failed to update job after error', jobId, innerErr);
         }
 
         summary.failed++;
-        summary.failures.push({ id: job.id, message: String(err?.message || err) });
+        summary.failures.push({ id: jobId, message: String(err?.message || err) });
       }
     }
 

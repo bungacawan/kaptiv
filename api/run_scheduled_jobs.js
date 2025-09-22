@@ -3,7 +3,7 @@ import { createClient } from '@supabase/supabase-js';
 import { google } from 'googleapis';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const GMAIL_CLIENT_ID = process.env.GMAIL_CLIENT_ID;
 const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
 const GMAIL_REDIRECT_URI = process.env.GMAIL_REDIRECT_URI;
@@ -11,7 +11,7 @@ const EMAIL_FROM = process.env.EMAIL_FROM || 'me';
 const BATCH_SIZE = parseInt(process.env.JOB_BATCH_SIZE || '20', 10);
 const MAX_ATTEMPTS = 5; // change as needed
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 /**
  * Sends an email using Gmail OAuth2 refresh token.

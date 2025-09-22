@@ -10,21 +10,17 @@ const REDIRECT_URI = process.env.REDIRECT_URI;
 const EMAIL_FROM = process.env.EMAIL_FROM || 'me';
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const BATCH_SIZE = parseInt(process.env.JOB_BATCH_SIZE || '20', 10);
-const MAX_ATTEMPTS = 5;
+const MAX_ATTEMPTS = 5; // max retries per job
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-/**
- * Sends an email using Gmail OAuth2 refresh token.
- * Returns the messageId on success.
- */
+// Send email via Gmail API using OAuth2 refresh token
 async function sendEmailViaGmail(refreshToken, to, subject, body_text) {
   const oAuth2Client = new google.auth.OAuth2(
     GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET,
     REDIRECT_URI
   );
-
   oAuth2Client.setCredentials({ refresh_token: refreshToken });
 
   const rawLines = [
@@ -35,34 +31,38 @@ async function sendEmailViaGmail(refreshToken, to, subject, body_text) {
     '',
     body_text || ''
   ];
-
-  const raw = Buffer.from(rawLines.join('\n')).toString('base64')
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const raw = Buffer.from(rawLines.join('\n'))
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
 
   const gmail = google.gmail({ version: 'v1', auth: oAuth2Client });
   const res = await gmail.users.messages.send({
     userId: 'me',
     requestBody: { raw }
   });
-
   return res?.data?.id;
 }
 
 export default async function handler(req, res) {
+  // Flexible header check to avoid 401 from cron-job.org
+  const incomingSecret =
+    (req.headers['x-worker-secret'] ||
+      req.headers['X-Worker-Secret'] ||
+      req.headers['x-worker-secret '])?.trim();
+
+  if (incomingSecret !== WORKER_SECRET) {
+    console.log('Unauthorized call, incoming secret:', incomingSecret);
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Trim incoming header to handle cron-job.org quirks
-  const incomingSecret = (req.headers['x-worker-secret'] || '').trim();
-  console.log('x-worker-secret received:', incomingSecret);
-
-  if (incomingSecret !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-
   try {
-    // Claim jobs atomically via Supabase RPC
+    // 1) Claim jobs atomically
     const { data: claimedJobs, error: rpcError } = await supabase
       .rpc('claim_scheduled_emails', { batch_size: BATCH_SIZE });
 
@@ -77,6 +77,7 @@ export default async function handler(req, res) {
     for (const job of claimedJobs) {
       const jobId = job.id;
       try {
+        // 2) Fetch refresh token for owner
         const { data: cred, error: credErr } = await supabase
           .from('credentials')
           .select('refresh_token')
@@ -97,10 +98,15 @@ export default async function handler(req, res) {
           continue;
         }
 
-        // Attempt send
-        const messageId = await sendEmailViaGmail(cred.refresh_token, job.to_email, job.subject, job.body_text);
+        // 3) Attempt send
+        const messageId = await sendEmailViaGmail(
+          cred.refresh_token,
+          job.to_email,
+          job.subject,
+          job.body_text
+        );
 
-        // On success
+        // 4) Update job as sent
         await supabase.from('scheduled_emails').update({
           status: 'sent',
           message_id: messageId || null,
@@ -109,10 +115,11 @@ export default async function handler(req, res) {
 
         summary.sent++;
       } catch (err) {
+        // Handle failure / backoff
         try {
           const attempts = job.attempts || 1;
           if (attempts < MAX_ATTEMPTS) {
-            const backoffMs = Math.pow(2, attempts) * 60 * 1000;
+            const backoffMs = Math.pow(2, attempts) * 60 * 1000; // exponential backoff
             const nextRun = new Date(Date.now() + backoffMs).toISOString();
 
             await supabase.from('scheduled_emails').update({
@@ -126,7 +133,7 @@ export default async function handler(req, res) {
             await supabase.from('scheduled_emails').update({
               status: 'failed',
               last_error: String(err?.message || err).slice(0, 1000),
-              attempts: (job.attempts || 1) + 1,
+              attempts: attempts + 1,
               updated_at: new Date().toISOString()
             }).eq('id', jobId);
           }

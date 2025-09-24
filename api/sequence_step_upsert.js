@@ -102,13 +102,16 @@ export default async function handler(req, res) {
     // determine step_order: if not provided, append as max(step_order)+1
     let stepOrder = body.step_order;
     if (stepOrder === null) {
-      const { data: maxRow, error: maxErr } = await supabase
+      // get the current highest step_order (if any)
+      const { data: rows, error: rowsErr } = await supabase
         .from('sequence_steps')
-        .select('max(step_order) as max_order', { count: 'exact' })
+        .select('step_order')
         .eq('sequence_id', body.sequence_id)
-        .single();
-      if (maxErr && maxErr.code !== 'PGRST116') throw maxErr; // ignore no rows error format
-      const maxOrder = (maxRow && maxRow.max_order) ? Number(maxRow.max_order) : 0;
+        .order('step_order', { ascending: false })
+        .limit(1);
+
+      if (rowsErr) throw rowsErr;
+      const maxOrder = (rows && rows.length && rows[0].step_order) ? Number(rows[0].step_order) : 0;
       stepOrder = maxOrder + 1;
     } else {
       // If provided and already exists, do NOT auto-shift. Return helpful error so UI can re-order or pick null.

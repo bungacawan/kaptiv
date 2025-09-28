@@ -1,160 +1,171 @@
-// /api/start_sequence.js
-import { createClient } from '@supabase/supabase-js';
+// start_sequence.js
+// Node/Express + supabase-js. Drop into your project and deploy.
+// npm i express @supabase/supabase-js
 
+const express = require('express');
+const { createClient } = require('@supabase/supabase-js');
+
+const app = express();
+app.use(express.json());
+
+// Expect these env vars
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const KAPTIV_API_KEY = process.env.KAPTIV_API_KEY; // keep this secret
-const DEFAULT_TIMEZONE = 'Asia/Singapore';
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.error('Missing Supabase env vars');
-  // If running in dev you might throw here to catch misconfig early
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // server-only service role key
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+  process.exit(1);
 }
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-
-// Validate incoming payload
-function validatePayload(body) {
-  if (!body) return 'Missing body';
-  if (!body.sequence_id) return 'Missing sequence_id';
-  if (!body.owner_id) return 'Missing owner_id';
-  // recipients optional (can be loaded from sequence_recipients)
-  return null;
-}
-
-export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-
-  // raw body log for debugging (Bubble payload)
-  console.log('/start_sequence RAW body:', JSON.stringify(req.body));
-
-  // Use lowercase header key — Node lowercases all incoming header names
-  const incomingKey = (req.headers['x-kaptiv-api-key'] || req.headers['kaptiv_api_key'] || '').toString().trim();
-  if (!KAPTIV_API_KEY || incomingKey !== KAPTIV_API_KEY) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-
-  const body = req.body || {};
-  const validationErr = validatePayload(body);
-  if (validationErr) return res.status(400).json({ error: validationErr });
-
-  const { sequence_id, owner_id } = body;
-  let { recipients, first_send_time, timezone } = body;
-
-  const tz = timezone || DEFAULT_TIMEZONE;
-
-  // parse scheduled base safely
-  let scheduledBase;
-  if (first_send_time) {
-    const parsed = new Date(first_send_time);
-    if (isNaN(parsed.getTime())) {
-      // not a valid date
-      return res.status(400).json({ error: 'invalid first_send_time' });
-    }
-    scheduledBase = parsed;
-  } else {
-    scheduledBase = new Date();
-  }
-
+/**
+ * POST /start_sequence
+ * Expected body (recommended):
+ * {
+ *   "sequence_id": "<sequence_id>",
+ *   "current_users_unique_id": "<owner id>",
+ *   "recipients": ["a@x.com","b@y.com"]   // or a string "a@x.com,b@y.com" or '["a@","b@"]'
+ * }
+ */
+app.post('/start_sequence', async (req, res) => {
   try {
-    // 1) load steps for this sequence in order
-    const { data: steps, error: stepsErr } = await supabase
-      .from('sequence_steps')
-      .select('*')
-      .eq('sequence_id', sequence_id)
-      .order('step_order', { ascending: true });
+    console.log('=== /start_sequence RAW BODY ===');
+    console.log(JSON.stringify(req.body, null, 2));
 
-    if (stepsErr) throw stepsErr;
-    if (!steps || steps.length === 0) return res.status(400).json({ error: 'sequence has no steps' });
+    // ---------- Normalize recipients ----------
+    let raw = req.body && req.body.recipients;
+    let recipients = [];
 
-    // 2) determine recipients: use provided array OR load from sequence_recipients table
-    let finalRecipients = [];
-    if (Array.isArray(recipients) && recipients.length) {
-      // allow recipients to be array of strings or array of { email }
-      finalRecipients = recipients.map(r => (typeof r === 'string' ? r : r?.email)).filter(Boolean);
-    }
+    if (!raw) raw = [];
 
-    if (finalRecipients.length === 0) {
-      const { data: recRows, error: recErr } = await supabase
-        .from('sequence_recipients')
-        .select('email')
-        .eq('sequence_id', sequence_id);
-      if (recErr) throw recErr;
-      finalRecipients = (recRows || []).map(r => r.email).filter(Boolean);
-    }
-
-    if (!finalRecipients.length) return res.status(400).json({ error: 'no recipients found' });
-
-    const createdRuns = [];
-    const createdJobs = [];
-
-    // 3) For each recipient, create sequence_run and schedule first step
-    for (const email of finalRecipients) {
-      // Prevent duplicate active run for same sequence + email
-      const { data: existingRuns } = await supabase
-        .from('sequence_runs')
-        .select('id,status')
-        .eq('sequence_id', sequence_id)
-        .eq('recipient_email', email)
-        .in('status', ['active', 'scheduled'])
-        .limit(1);
-
-      if (existingRuns && existingRuns.length) {
-        console.log(`Skipping ${email} — existing active run found (id=${existingRuns[0].id})`);
-        continue; // skip creating duplicate run
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim();
+      // If JSON stringified array -> parse
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) recipients = parsed;
+        else if (typeof parsed === 'string') {
+          // single string inside quotes -> split
+          recipients = parsed.split(',').map(s => s.trim()).filter(Boolean);
+        }
+      } catch (e) {
+        // not JSON -> split by comma
+        recipients = trimmed.split(',').map(s => s.trim()).filter(Boolean);
       }
-
-      const insertRun = {
-        sequence_id,
-        recipient_email: email,
-        owner_id,
-        current_step: 0,
-        status: 'active',
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      };
-
-      const { data: runData, error: runErr } = await supabase
-        .from('sequence_runs')
-        .insert([insertRun])
-        .select()
-        .single();
-
-      if (runErr) throw runErr;
-      createdRuns.push(runData);
-
-      // schedule first step (you may want to compute offsets from step metadata)
-      const firstStep = steps[0];
-      const scheduledForIso = new Date(scheduledBase).toISOString();
-
-      const jobPayload = {
-        owner_id,
-        to_email: email,
-        subject: firstStep.subject,
-        body_text: firstStep.body_text,
-        scheduled_for: scheduledForIso,
-        timezone: tz,
-        status: 'scheduled',
-        attempts: 0,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        sequence_run_id: runData.id,
-        step_id: firstStep.id
-      };
-
-      const { data: jobData, error: jobErr } = await supabase
-        .from('scheduled_emails')
-        .insert([jobPayload])
-        .select()
-        .single();
-
-      if (jobErr) throw jobErr;
-      createdJobs.push(jobData);
+    } else if (Array.isArray(raw)) {
+      recipients = raw;
+    } else {
+      // maybe array of objects
+      try {
+        recipients = Array.from(raw);
+      } catch (e) {
+        recipients = [];
+      }
     }
 
-    return res.status(201).json({ ok: true, runs: createdRuns, jobs: createdJobs });
+    // If array of objects with email fields -> map to emails
+    if (recipients.length && typeof recipients[0] === 'object') {
+      recipients = recipients.map(r => (r && (r.email || r.address || r.email_address)) || null).filter(Boolean);
+    }
+
+    // Normalize strings + dedupe (preserve order)
+    const seen = new Set();
+    recipients = recipients
+      .map(r => String(r || '').trim())
+      .filter(Boolean)
+      .filter(r => {
+        const k = r.toLowerCase();
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+
+    console.log('Normalized recipients:', recipients);
+
+    if (!Array.isArray(recipients) || recipients.length === 0) {
+      return res.status(400).json({ error: 'no recipients after normalization', raw: req.body.recipients });
+    }
+
+    // ---------- Required metadata ----------
+    const sequence_id = req.body.sequence_id || null; // optional, used for jobs/steps linking
+    const owner_id = req.body.current_users_unique_id || req.body.owner_id || null;
+
+    // ---------- Create sequence_run rows (one per recipient) ----------
+    // Adjust columns to match your schema. Example columns used:
+    // id (uuid), sequence_id, recipient_email, owner_id, current_step, status, created_at
+    const now = new Date().toISOString();
+    const sequenceRuns = recipients.map(email => ({
+      sequence_id: sequence_id,
+      recipient_email: email,
+      owner_id: owner_id,
+      current_step: 0,
+      status: 'active',
+      created_at: now,
+      updated_at: now
+    }));
+
+    // Insert (or upsert to avoid duplicates). Change onConflict keys to your table's unique constraint.
+    const { data: runsData, error: runsError } = await supabase
+      .from('sequence_runs')
+      .upsert(sequenceRuns, { onConflict: ['sequence_id', 'recipient_email'] }); // change keys if needed
+
+    if (runsError) {
+      console.error('Error upserting sequence_runs:', runsError);
+      return res.status(500).json({ error: 'supabase_sequence_runs_error', detail: runsError });
+    }
+
+    console.log('sequence_runs upserted count:', runsData ? runsData.length : 0);
+
+    // Map created run ids back to recipients if available
+    // Note: supabase upsert returns the rows (if allowed)
+    const runIdsByEmail = {};
+    if (Array.isArray(runsData)) {
+      runsData.forEach(r => {
+        if (r && r.recipient_email) runIdsByEmail[r.recipient_email.toLowerCase()] = r.id;
+      });
+    }
+
+    // ---------- Insert / upsert into sequence_recipient (if you use this table) ----------
+    // Adjust columns to match your schema: sequence_run_id, sequence_id, email, owner_id, created_at
+    const recipientRows = recipients.map(email => ({
+      sequence_run_id: runIdsByEmail[email.toLowerCase()] || null,
+      sequence_id: sequence_id,
+      email,
+      owner_id,
+      created_at: now
+    }));
+
+    const { data: recData, error: recError } = await supabase
+      .from('sequence_recipient')
+      .upsert(recipientRows, { onConflict: ['sequence_run_id', 'email'] }); // change to your unique keys
+
+    if (recError) {
+      console.error('Error upserting sequence_recipient:', recError);
+      // Not fatal necessarily—return error for debugging
+      return res.status(500).json({ error: 'supabase_sequence_recipient_error', detail: recError });
+    }
+
+    console.log('sequence_recipient upserted count:', recData ? recData.length : 0);
+
+    // ---------- Optionally: schedule jobs / create job rows (example) ----------
+    // If your helper schedules emails (jobs) per step, handle that here. Example omitted.
+
+    // ---------- Success response ----------
+    return res.status(200).json({
+      ok: true,
+      runs: runsData || [],
+      sequence_recipient: recData || []
+    });
+
   } catch (err) {
-    console.error('start_sequence error', err);
-    return res.status(500).json({ error: String(err?.message || err) });
+    console.error('Unhandled error in /start_sequence:', err);
+    return res.status(500).json({ error: 'internal_error', detail: String(err) });
   }
+});
+
+// If running standalone (node start_sequence.js)
+if (require.main === module) {
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => console.log(`start_sequence listening on ${port}`));
 }
+
+module.exports = app;
